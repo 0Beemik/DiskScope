@@ -12,6 +12,11 @@ ICON="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps/diskscope
 
 say() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+refresh_menu() {
+    if command -v update-desktop-database >/dev/null; then
+        update-desktop-database "$(dirname "$DESKTOP")" 2>/dev/null || true
+    fi
+}
 
 if [ "${1:-}" = "--uninstall" ]; then
     if command -v systemctl >/dev/null; then
@@ -20,7 +25,7 @@ if [ "${1:-}" = "--uninstall" ]; then
     rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/diskscope-check."{service,timer}
     rm -rf "$APP_DIR" "$BIN_DIR/diskscope" "$DESKTOP" "$ICON" \
            "${XDG_CACHE_HOME:-$HOME/.cache}/diskscope" "${XDG_CONFIG_HOME:-$HOME/.config}/diskscope"
-    command -v update-desktop-database >/dev/null && update-desktop-database "$(dirname "$DESKTOP")" 2>/dev/null || true
+    refresh_menu
     say "DiskScope removed."
     exit 0
 fi
@@ -76,7 +81,7 @@ esac
         echo "Exec=$admin_exec"
     fi
 } > "$DESKTOP"
-command -v update-desktop-database >/dev/null && update-desktop-database "$(dirname "$DESKTOP")" 2>/dev/null || true
+refresh_menu
 
 say "Installed DiskScope $(python3 "$APP_DIR/diskscope.py" --version | awk '{print $2}')"
 echo "    Start it from your app menu, or run:  diskscope"
