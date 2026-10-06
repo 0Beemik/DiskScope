@@ -2,6 +2,8 @@
 
 **One app to find out what's eating your disk, and fix it.** DiskScope replaces a folder-size tool, a duplicate finder, a similar-photo finder, a cache cleaner and a backup-size checker with a single window. It also tells you **what changed since last time**, and it can warn you before a drive fills up.
 
+Each drive's last scan is saved, so DiskScope **opens instantly** with your previous results ("Scanned 9 days ago"). Press **Rescan** whenever you want fresh numbers.
+
 It's a single Python file that uses only the standard library. Nothing leaves your machine.
 
 ![Browse view with treemap](docs/browse.png)
@@ -31,7 +33,7 @@ curl -fsSL https://raw.githubusercontent.com/0Beemik/DiskScope/main/install.sh |
 
 | Tab | |
 |---|---|
-| **Overview** | Every drive at a glance. A bar showing where every byte of a drive goes, including space **only admins can read** and space **reserved by the filesystem**, the two usual reasons for "missing" space. A ranked list of **ways to free space** with one click to each. |
+| **Overview** | Every drive at a glance, with when each was last scanned (click one to open its saved scan). A bar showing where every byte of a drive goes, including space **only admins can read** and space **reserved by the filesystem**, the two usual reasons for "missing" space. A ranked list of **ways to free space** with one click to each. |
 | **Changes** | Each scan is saved, so you see **what grew and what shrank** since any earlier scan: folders, new big files, and files that are gone. Folders are collapsed to the one that actually changed. |
 | **Browse** | Clickable treemap and sorted list. Filter by name, and drive it all from the keyboard. |
 | **Largest files** | Filter by kind (AI models, video, images, disk images, archives) or **"unused for over a year"**. |
@@ -50,7 +52,8 @@ curl -fsSL https://raw.githubusercontent.com/0Beemik/DiskScope/main/install.sh |
 ## Usage
 
 ```bash
-diskscope                 # scan the whole system drive
+diskscope                 # open the system drive (its saved scan, or scan it the first time)
+diskscope --rescan        # scan now instead of opening the saved scan
 diskscope /mnt/data       # scan another drive or folder (or click a drive on the Overview)
 diskscope --tab           # use a normal browser tab instead of an app window
 diskscope --check         # one-off low-space check (what the alert timer runs)
@@ -72,7 +75,7 @@ Closing the window stops DiskScope. Press <kbd>?</kbd> for keyboard shortcuts.
 
 ## Privacy
 
-The UI is served on `127.0.0.1` only. It needs a random per-session token and rejects requests whose `Host` isn't localhost, which blocks other websites from talking to it. Saved data lives in `~/.cache/diskscope` (scan history, activity log, photo fingerprints) and `~/.config/diskscope` (settings).
+The UI is served on `127.0.0.1` only. It needs a random per-session token and rejects requests whose `Host` isn't localhost, which blocks other websites from talking to it. Saved data lives in `~/.cache/diskscope` (saved scans, readable only by you; scan history; activity log; photo fingerprints) and `~/.config/diskscope` (settings).
 
 ## Development
 

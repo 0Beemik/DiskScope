@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0
+
+- **Saved scans:** each drive's (or folder's) last scan is saved and opens instantly (under a second instead of a full scan) at launch and when switching drives. Duplicate and similar-media results are kept too.
+- The header shows "Scanned 9 days ago"; the button becomes **Rescan** for a fresh scan. Drive cards show when each was last scanned. `--rescan` forces a scan from the command line.
+- Removals, merges and restores update the saved scan, so reopening shows the current state.
+
 ## 0.2.0
 
 - **Opens as its own app window** (Chrome/Chromium/Brave/Edge `--app` mode) and quits when the window closes.

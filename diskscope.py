@@ -31,7 +31,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-VERSION = '0.2.0'
+VERSION = '0.3.0'
 SCRIPT = os.path.abspath(__file__)
 
 IS_ROOT = os.geteuid() == 0
@@ -315,6 +315,7 @@ class Scan:
         self.started, self.finished = time.time(), None
         self.disk = mount_info(self.root)
         self.last = None
+        self.cached = False                # opened from a saved scan instead of scanning
 
     def contains(self, path):
         return path == self.root or path.startswith(self.root.rstrip('/') + '/')
@@ -330,15 +331,27 @@ class Scan:
             self._walk()
             self.finished = time.time()
             self.disk = mount_info(self.root)
+            for save in (save_history, save_scan):     # save before reporting done
+                try:
+                    save(self)
+                except Exception as e:
+                    print(f'could not save scan ({save.__name__}): {e!r}', file=sys.stderr)
             self.state = 'done'
-            try:
-                save_history(self)
-            except Exception as e:
-                print(f'could not save scan history: {e!r}', file=sys.stderr)
         except Exception as e:  # keep the UI alive and show what happened
             self.state = 'error'
             self.errors.insert(0, f'scan failed: {e!r}')
         self.finished = self.finished or time.time()
+
+    def load_saved(self):
+        """Open the saved scan of this folder; fall back to scanning if it's missing or unreadable."""
+        try:
+            ok = restore_scan(self)
+        except Exception as e:
+            print(f'could not load saved scan: {e!r}', file=sys.stderr)
+            ok = False
+        if not ok:
+            self.__init__(self.root)
+            self.run()
 
     def _walk(self):
         root_dev = os.lstat(self.root).st_dev
@@ -464,6 +477,7 @@ class Scan:
             self.files -= nfiles
             for job in (DUPES, SIMILAR):
                 job.forget(gone)
+        persist_later()
 
 
 def junk_ok(parent, name, path):
@@ -512,8 +526,8 @@ def save_history(scan):
             pass
 
 
-def last_scan_summary(root):
-    for h in list_history(root):
+def last_scan_summary(root, hist=None):
+    for h in (list_history(root) if hist is None else hist):
         d = load_json(h['file'], None)
         if d:
             return {'time': d['time'], 'scanned': d['scanned'], 'used': d['disk']['used']}
@@ -558,6 +572,95 @@ def api_changes(vs=None):
             'summary': {'time': prev['time'], 'used_delta': s.disk['used'] - prev['disk']['used'],
                         'scanned_delta': s.bytes - prev['scanned'], 'free': s.disk['free']},
             'dirs': rows[:80], 'new_files': new_files[:40], 'gone_files': gone_files[:40]}
+
+
+# ---------------------------------------------------------------- saved scans (open instantly)
+
+SCAN_FORMAT = 1
+_SAVED_FIELDS = ('files', 'dirs', 'bytes', 'err_count', 'errors', 'types', 'cats', 'ts_unique', 'ts_prefix',
+                 'empty_dirs', 'started', 'finished', 'disk', 'stale_data')
+_persist = {'timer': None}
+
+
+def scan_file(root):
+    key = 'root' if root == '/' else root.strip('/').replace('/', '_')
+    return os.path.join(CACHE_DIR, 'scans', key + '.json.gz')
+
+
+def saved_scan_info(root):
+    """Small summary of a saved scan, without loading it."""
+    d = load_json(scan_file(root)[:-len('.json.gz')] + '.meta.json', None)
+    return d if d and d.get('v') == SCAN_FORMAT and d.get('root') == root else None
+
+
+def save_scan(scan):
+    with LOCK:
+        data = {'v': SCAN_FORMAT, 'root': scan.root,
+                'dir_map': {p: [sz, scan.dir_files.get(p, 0)] for p, sz in scan.dir_size.items()},
+                'top': list(scan.top), 'stale': list(scan.stale), 'models': list(scan.models),
+                'media': list(scan.media), 'junk': list(scan.junk),
+                'by_size': {str(k): v for k, v in scan.by_size.items() if len(v) > 1},
+                **{f: getattr(scan, f) for f in _SAVED_FIELDS}}
+        if DUPES.state == 'done':
+            data['dupes'] = {'groups': DUPES.groups, 'total': DUPES.total}
+        if SIMILAR.state == 'done':
+            data['similar'] = {'groups': SIMILAR.groups, 'total': SIMILAR.total}
+    path = scan_file(scan.root)
+    user_dir(os.path.dirname(path))
+    tmp = path + '.tmp'
+    with gzip.open(tmp, 'wt', compresslevel=1) as f:
+        json.dump(data, f, separators=(',', ':'))
+    os.chmod(tmp, 0o600)             # file names are private
+    os.replace(tmp, path)
+    chown_user(path)
+    save_json(path[:-len('.json.gz')] + '.meta.json',
+              {'v': SCAN_FORMAT, 'root': scan.root, 'time': scan.finished, 'bytes': scan.bytes, 'files': scan.files})
+
+
+def restore_scan(scan):
+    d = load_json(scan_file(scan.root), None)
+    if not d or d.get('v') != SCAN_FORMAT or d.get('root') != scan.root:
+        return False
+    for f in _SAVED_FIELDS:
+        setattr(scan, f, d[f])
+    scan.dir_size = {p: v[0] for p, v in d['dir_map'].items()}
+    scan.dir_files = {p: v[1] for p, v in d['dir_map'].items()}
+    scan.top = [tuple(t) for t in d['top']]
+    scan.stale = [tuple(t) for t in d['stale']]
+    heapq.heapify(scan.top)
+    heapq.heapify(scan.stale)
+    scan.models = [tuple(t) for t in d['models']]
+    scan.media = [tuple(t) for t in d['media']]
+    scan.junk = [tuple(t) for t in d['junk']]
+    scan.by_size = {int(k): v for k, v in d['by_size'].items()}
+    earlier = [h for h in list_history(scan.root) if h['time'] < int(scan.finished)]
+    scan.last = last_scan_summary(scan.root, earlier)
+    if d.get('dupes'):
+        DUPES.groups, DUPES.total, DUPES.done, DUPES.state = d['dupes']['groups'], d['dupes']['total'], d['dupes']['total'], 'done'
+    if d.get('similar'):
+        SIMILAR.groups, SIMILAR.total, SIMILAR.done, SIMILAR.state = (d['similar']['groups'], d['similar']['total'],
+                                                                       d['similar']['total'], 'done')
+    scan.cached = True
+    scan.current = ''
+    scan.state = 'done'
+    return True
+
+
+def persist_later(delay=3):
+    """Re-save the open scan shortly after a change (debounced), so reopening shows the current state."""
+    if _persist['timer']:
+        _persist['timer'].cancel()
+    s = SCAN
+    if not s or s.state != 'done':
+        return
+
+    def work():
+        try:
+            save_scan(s)
+        except Exception as e:
+            print(f'could not save scan: {e!r}', file=sys.stderr)
+    _persist['timer'] = threading.Timer(delay, work)   # non-daemon: finishes even if DiskScope is quitting
+    _persist['timer'].start()
 
 
 # ---------------------------------------------------------------- duplicates
@@ -608,6 +711,7 @@ class Dupes:
         self.groups = groups
         self.done = self.total
         self.state = 'done'
+        persist_later(0)
 
     def _hash(self, path, size, partial, meta):
         h = hashlib.blake2b(digest_size=20)
@@ -679,6 +783,7 @@ def split(path):
     log_activity('split', path, st.st_blocks * 512)
     if SCAN:
         SCAN.stale_data = True
+        persist_later()
 
 
 # ---------------------------------------------------------------- similar photos & videos
@@ -766,6 +871,7 @@ class Similar:
         groups.sort(key=lambda g: -g['total'])
         self.groups = groups
         self.state = 'done'
+        persist_later(0)
 
 
 def thumbnail(path):
@@ -977,6 +1083,7 @@ def ts_delete(name):
     if SCAN:
         SCAN.stale_data = True
         SCAN.ts_unique.pop(name, None)
+        persist_later()
     return unique
 
 
@@ -1041,6 +1148,7 @@ def restore(path):
     log_activity('restore', path, 0)
     if SCAN:
         SCAN.stale_data = True
+        persist_later()
 
 
 def api_activity():
@@ -1360,17 +1468,28 @@ class Life:
     keep = False
 
 
-def start_scan(path):
+def start_scan(path, fresh=True):
+    """Scan `path`, or with fresh=False open its saved scan when there is one."""
     global SCAN, DUPES, SIMILAR
     path = os.path.abspath(os.path.expanduser(path))
     if not os.path.isdir(path):
         raise ValueError(f'not a folder: {path}')
-    if SCAN and SCAN.state == 'scanning':
+    if SCAN and SCAN.state in ('scanning', 'loading'):
         raise ValueError('a scan is already running')
+    pending = _persist['timer']
+    if pending and pending.is_alive():    # flush unsaved changes to the scan we're leaving
+        pending.cancel()
+        if SCAN and SCAN.state == 'done':
+            save_scan(SCAN)
+    _persist['timer'] = None
     SCAN = Scan(path)
     DUPES = Dupes()
     SIMILAR = Similar()
-    threading.Thread(target=SCAN.run, daemon=True).start()
+    if not fresh and os.path.exists(scan_file(path)):
+        SCAN.state = 'loading'
+        threading.Thread(target=SCAN.load_saved, daemon=True).start()
+    else:
+        threading.Thread(target=SCAN.run, daemon=True).start()
 
 
 def need_scan():
@@ -1386,7 +1505,8 @@ def api_status():
         'files': s.files if s else 0, 'dirs': s.dirs if s else 0, 'bytes': s.bytes if s else 0,
         'current': s.current if s else '', 'used': s.disk['used'] if s else 0,
         'elapsed': ((s.finished or time.time()) - s.started) if s else 0, 'last': s.last if s else None,
-        'stale': bool(s and s.stale_data),
+        'stale': bool(s and s.stale_data), 'cached': bool(s and s.cached),
+        'scanned_at': s.finished if s and s.state == 'done' else None,
         'dupes': {'state': DUPES.state, 'done': DUPES.done, 'total': DUPES.total},
         'similar': {'state': SIMILAR.state, 'done': SIMILAR.done, 'total': SIMILAR.total},
         'is_root': IS_ROOT, 'home': HOME, 'user': USER_NAME, 'version': VERSION,
@@ -1402,7 +1522,16 @@ def api_overview():
     return {'root': s.root, 'disk': disk, 'scanned': s.bytes, 'files': s.files, 'dirs': s.dirs,
             'elapsed': s.finished - s.started, 'err_count': s.err_count, 'errors': s.errors[:40],
             'children': kids, 'cats': cats, 'is_root': IS_ROOT, 'last': s.last, 'insights': insights(s, disk),
-            'stale': s.stale_data, 'mounts': list_mounts()}
+            'stale': s.stale_data, 'mounts': mounts_with_age(), 'cached': s.cached, 'scanned_at': s.finished,
+            'used_at_scan': s.disk['used']}
+
+
+def mounts_with_age():
+    out = list_mounts()
+    for m in out:
+        info = saved_scan_info(m['mount'])
+        m['scanned_at'] = info['time'] if info else None
+    return out
 
 
 def api_ls(path):
@@ -1593,7 +1722,7 @@ class Handler(BaseHTTPRequestHandler):
             '/api/changes': lambda: api_changes(q.get('vs')),
             '/api/activity': api_activity,
             '/api/settings': api_settings,
-            '/api/mounts': lambda: {'mounts': list_mounts()},
+            '/api/mounts': lambda: {'mounts': mounts_with_age()},
             '/api/elevate': elevate_status,
         }
         fn = routes.get(u.path)
@@ -1618,7 +1747,7 @@ class Handler(BaseHTTPRequestHandler):
         p = u.path
 
         def scan():
-            start_scan(body.get('path') or '/')
+            start_scan(body.get('path') or '/', fresh=body.get('fresh', True))
             return {'ok': True}
 
         def job(obj):
@@ -1860,7 +1989,8 @@ details summary{cursor:pointer}
 </style></head><body>
 <header>
   <div class="brand"><svg viewBox="0 0 64 64" aria-hidden="true"><rect x="4" y="4" width="56" height="56" rx="12" fill="#1b2128"/><rect x="10" y="10" width="26" height="44" rx="3" fill="#4b84d6"/><rect x="38" y="10" width="16" height="20" rx="3" fill="#7c5cd6"/><rect x="38" y="32" width="16" height="11" rx="3" fill="#d9622b"/><rect x="38" y="45" width="7" height="9" rx="2" fill="#22998b"/><rect x="47" y="45" width="7" height="9" rx="2" fill="#c29a17"/></svg>DiskScope</div>
-  <form id="scanform"><input type="text" id="scanpath" spellcheck="false" aria-label="Folder to scan"><button class="primary">Scan</button></form>
+  <form id="scanform"><input type="text" id="scanpath" spellcheck="false" aria-label="Folder to scan"><button class="primary" id="scanbtn">Scan</button></form>
+  <span class="who" id="age"></span>
   <div class="hdr-right"><span class="who" id="who"></span><button class="small hidden" id="elev">Run as admin</button>
   <button class="small" id="helpbtn" title="Keyboard shortcuts (?)">?</button><button class="small" id="quit" title="Stop DiskScope">Quit</button></div>
 </header>
@@ -1926,10 +2056,12 @@ addEventListener('pagehide',()=>navigator.sendBeacon('/api/bye?t='+TOKEN));
 async function poll(){
   let s;try{s=await api('/api/status')}catch(e){$('#ptext').textContent='DiskScope stopped.';$('#progress').classList.remove('hidden');return}
   st.status=s;
+  showAge();
   $('#who').textContent=s.is_root?'Admin mode: sees everything':'';
   $('#elev').classList.toggle('hidden',s.is_root);
   const prog=$('#progress');
   const show=(html,pct)=>{prog.classList.remove('hidden');$('#ptext').innerHTML=html;$('#pfill').style.width=Math.max(0,Math.min(100,pct))+'%'};
+  if(s.scan==='loading'){show(`Opening the saved scan of <b>${esc(s.root)}</b>…`,100);setTimeout(poll,300);return}
   if(s.scan==='scanning'){
     const last=s.last?` <span class="muted">· last scan ${ago(s.last.time)}: ${fmt(s.last.scanned)}</span>`:'';
     show(`Scanning <b>${esc(s.root)}</b>: ${num(s.files)} files, ${fmt(s.bytes)}${last}<div class="muted small path">${esc(s.current)}</div>`,s.bytes/Math.max(1,s.used)*100);
@@ -1939,11 +2071,20 @@ async function poll(){
   if(s.similar.state==='running'){show(`Comparing photos and videos: ${num(s.similar.done)} of ${num(s.similar.total)}`,s.similar.total?s.similar.done/s.similar.total*100:0);st.jobRunning=true;setTimeout(poll,700);return}
   prog.classList.add('hidden');
   if(st.jobRunning){st.jobRunning=false;if(['dupes','similar','overview'].includes(st.tab))load()}
-  if(s.scan==='done'&&!st.loaded){st.loaded=true;st.root=s.root;st.cwd=s.root;st.vs=null;$('#scanpath').value=s.root;load()}
+  if(s.scan==='done'&&!st.loaded){st.loaded=true;st.root=s.root;st.cwd=s.root;st.vs=null;$('#scanpath').value=s.root;showAge();load()}
   if(s.scan==='error'){$('#overview').innerHTML='<div class="panel">Scan failed. Try another folder.</div>'}
 }
-async function startScan(path){
-  try{await api('/api/scan',{path});st.loaded=false;$$('section').forEach(s=>s.innerHTML='<div class="empty">Scanning…</div>');
+function showAge(){
+  const s=st.status,el=$('#age');if(!s)return;
+  el.textContent=s.scan==='done'&&s.scanned_at?'Scanned '+ago(s.scanned_at):'';
+  el.title=s.scanned_at?new Date(s.scanned_at*1000).toLocaleString():'';
+  $('#scanbtn').textContent=s.root&&$('#scanpath').value.trim()===s.root&&s.scan==='done'?'Rescan':'Scan';
+}
+setInterval(showAge,60000);
+$('#scanpath').oninput=showAge;
+async function startScan(path,fresh=true){
+  if(!fresh&&st.status&&st.status.root===path&&st.status.scan==='done'){selectTab('overview');return}
+  try{await api('/api/scan',{path,fresh});st.loaded=false;$$('section').forEach(s=>s.innerHTML='<div class="empty">Scanning…</div>');
     if(st.tab!=='overview')selectTab('overview');poll()}catch(err){toast(err.message)}
 }
 $('#scanform').onsubmit=e=>{e.preventDefault();startScan($('#scanpath').value.trim()||'/')};
@@ -1985,7 +2126,8 @@ async function removePaths(paths,permanent,label){
 }
 function copy(text){navigator.clipboard.writeText(text).then(()=>toast('Copied. Paste it in a terminal.'),()=>prompt('Copy this command:',text))}
 document.addEventListener('click',e=>{
-  const b=e.target.closest('[data-act],[data-copy],[data-goto],[data-scan],[data-elevate]');if(!b)return;
+  const b=e.target.closest('[data-act],[data-copy],[data-goto],[data-scan],[data-open],[data-elevate]');if(!b)return;
+  if(b.dataset.open){startScan(b.dataset.open,false);return}
   if(b.dataset.copy!=null){copy(b.dataset.copy);return}
   if(b.dataset.goto){go(b.dataset.goto,b.dataset.cat?{cat:b.dataset.cat}:{});return}
   if(b.dataset.scan){startScan(b.dataset.scan);return}
@@ -2021,8 +2163,9 @@ function wireSel(box){
 
 // ---------- overview
 function mountsHtml(ms,root){
-  return `<div class="mounts">${ms.map(m=>`<button class="mount ${m.mount===root?'on':''}" data-scan="${esc(m.mount)}" title="Scan ${esc(m.mount)}">
+  return `<div class="mounts">${ms.map(m=>`<button class="mount ${m.mount===root?'on':''}" data-open="${esc(m.mount)}" title="${m.scanned_at?'Open the saved scan of':'Scan'} ${esc(m.mount)}">
     <b>${esc(m.label)}</b><span class="muted small path">${esc(m.mount)}</span><span class="small">${fmt(m.free)} free of ${fmt(m.total)}</span>
+    <span class="muted small">${m.scanned_at?'Scanned '+ago(m.scanned_at):'Not scanned yet'}</span>
     <span class="bar"><i style="width:${m.used/m.total*100}%;background:${m.free/m.total<0.1?'var(--danger)':'var(--c-dir)'}"></i></span></button>`).join('')}</div>`;
 }
 async function loadOverview(el){
@@ -2035,7 +2178,8 @@ async function loadOverview(el){
   let notes='';
   if(d.reserved>0)notes+=`<div class="note"><b>${fmt(d.reserved)}</b> is reserved by the filesystem so the system keeps working if the disk fills up. It counts as neither used nor free.${d.fstype.startsWith('ext')?` On a desktop drive you can safely shrink it from 5% to 1%: <code>sudo tune2fs -m 1 ${esc(d.device)}</code>`:''}</div>`;
   if(o.err_count)notes+=`<details style="margin-top:10px"><summary class="muted">${num(o.err_count)} folders/files couldn't be read</summary><pre style="white-space:pre-wrap;font-size:12px">${esc(o.errors.join('\n'))}</pre></details>`;
-  const since=o.last?`<div class="note ${o.disk.used-o.last.used>0?'':'ok'}" style="margin:0 0 16px">Since the last scan (${ago(o.last.time)}), the drive's used space changed by <b>${signed(o.disk.used-o.last.used)}</b>. <a href="#changes" data-goto="changes">See what changed →</a></div>`:'';
+  const since=o.cached?`<div class="note" style="margin:0 0 16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap"><span style="flex:1">Showing the saved scan from <b>${new Date(o.scanned_at*1000).toLocaleString()}</b> (${ago(o.scanned_at)}). Since then the drive's used space changed by <b>${signed(o.disk.used-o.used_at_scan)}</b>.</span><button class="small primary" data-scan="${esc(o.root)}">Rescan now</button></div>`
+    :o.last?`<div class="note ${o.disk.used-o.last.used>0?'':'ok'}" style="margin:0 0 16px">Since the last scan (${ago(o.last.time)}), the drive's used space changed by <b>${signed(o.disk.used-o.last.used)}</b>. <a href="#changes" data-goto="changes">See what changed →</a></div>`:'';
   const stale=o.stale?`<div class="note" style="margin:0 0 16px">Files were restored or snapshots deleted since this scan. <button class="small" data-scan="${esc(o.root)}">Rescan</button> for exact numbers.</div>`:'';
   el.innerHTML=`${mountsHtml(o.mounts,o.root)}${stale}${since}
   <div class="tiles">
@@ -2043,7 +2187,7 @@ async function loadOverview(el){
     <div class="tile"><div class="k">Used</div><div class="v">${fmt(d.used)}</div></div>
     <div class="tile"><div class="k">Free</div><div class="v">${fmt(d.free)}</div></div>
     <div class="tile"><div class="k">Files scanned</div><div class="v">${num(o.files)}</div></div>
-    <div class="tile"><div class="k">Scan time</div><div class="v">${o.elapsed.toFixed(1)} s</div></div>
+    <div class="tile"><div class="k">Scan took</div><div class="v">${o.elapsed.toFixed(1)} s</div></div>
   </div>
   <div class="panel"><h2>Where the drive's space goes <span class="muted" style="font-weight:400">· ${esc(d.mount)} (${esc(d.device)})</span></h2>
     <div class="stack" role="img" aria-label="Drive usage">${segs.filter(s=>s[1]>0).map(s=>`<i style="width:${s[1]/d.total*100}%;background:${col(s[2])}" title="${esc(s[0])}: ${fmt(s[1])}"></i>`).join('')}</div>
@@ -2395,6 +2539,7 @@ def main():
     ap = argparse.ArgumentParser(prog='diskscope', description='See what is using your disk and clean it up: folders, '
                                  'big files, AI models, duplicates, caches, backups. Opens a local window.')
     ap.add_argument('path', nargs='?', default='/', help='folder or drive to scan (default: / , the whole drive)')
+    ap.add_argument('--rescan', action='store_true', help='scan now instead of opening the saved scan')
     ap.add_argument('--port', type=int, default=0, help='port to listen on (default: random)')
     ap.add_argument('--no-browser', action='store_true', help="don't open a window, just print the URL")
     ap.add_argument('--tab', action='store_true', help='open in a normal browser tab instead of an app window')
@@ -2414,7 +2559,7 @@ def main():
         print('Low-space alerts', 'enabled (checks hourly).' if args.enable_alerts else 'disabled.')
         return
     try:
-        start_scan(args.path)
+        start_scan(args.path, fresh=args.rescan)
     except ValueError as e:
         ap.error(str(e))
     srv = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)

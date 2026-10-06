@@ -155,6 +155,80 @@ class DuplicateTests(Base):
         self.assertNotEqual(os.stat(a).st_ino, os.stat(b).st_ino)
 
 
+def wait_persist():
+    timer = ds._persist['timer']
+    if timer:
+        timer.join(10)
+
+
+class SavedScanTests(Base):
+    def test_reopen_uses_saved_scan_until_rescan(self):
+        write(f'{self.root}/a/one.bin', self.blob)
+        s1 = run_scan(self.root)
+        self.assertFalse(s1.cached)
+        self.assertTrue(os.path.exists(ds.scan_file(self.root)))
+        self.assertEqual(ds.saved_scan_info(self.root)['files'], 1)
+        write(f'{self.root}/b/new.bin', self.blob)            # appears after the scan
+        ds.start_scan(self.root, fresh=False)
+        for _ in range(200):
+            if ds.SCAN.state == 'done':
+                break
+            time.sleep(0.02)
+        s2 = ds.SCAN
+        self.assertTrue(s2.cached)
+        self.assertEqual(s2.files, 1)                           # saved data, not a new scan
+        self.assertEqual(s2.dir_size, s1.dir_size)
+        self.assertEqual(sorted(s2.top), sorted(s1.top))
+        self.assertEqual(s2.finished, s1.finished)
+        s3 = run_scan(self.root)                                # Scan button = fresh scan
+        self.assertFalse(s3.cached)
+        self.assertEqual(s3.files, 2)
+
+    def reopen(self):
+        ds.start_scan(self.root, fresh=False)
+        for _ in range(200):
+            if ds.SCAN.state == 'done':
+                break
+            time.sleep(0.02)
+        self.assertTrue(ds.SCAN.cached)
+        return ds.SCAN
+
+    def test_results_and_removals_are_kept(self):
+        a = write(f'{self.root}/one/data.bin', self.blob)
+        b = write(f'{self.root}/two/data.bin', self.blob)
+        gone = write(f'{self.root}/three/old.bin', os.urandom(MB))
+        s = run_scan(self.root)
+        ds.DUPES.run(s)
+        wait_persist()
+        ds.remove(gone, permanent=True)
+        wait_persist()
+        s2 = self.reopen()
+        self.assertEqual(s2.dir_size[f'{self.root}/three'], 0)
+        self.assertEqual(s2.dir_size[self.root], os.lstat(a).st_blocks * 512 * 2)
+        self.assertEqual(s2.files, 2)
+        self.assertEqual(ds.DUPES.state, 'done')
+        self.assertEqual(len(ds.DUPES.groups), 1)
+        ds.merge(ds.DUPES.groups[0]['paths'][0], ds.DUPES.groups[0]['paths'][1:])   # still works after reload
+        self.assertEqual(os.stat(a).st_ino, os.stat(b).st_ino)
+        wait_persist()
+        self.reopen()
+        self.assertEqual(ds.DUPES.groups, [])
+
+    def test_corrupt_saved_scan_falls_back_to_scanning(self):
+        write(f'{self.root}/a/one.bin', self.blob)
+        run_scan(self.root)
+        with open(ds.scan_file(self.root), 'wb') as f:
+            f.write(b'not gzip')
+        ds.start_scan(self.root, fresh=False)
+        for _ in range(300):
+            if ds.SCAN.state == 'done':
+                break
+            time.sleep(0.02)
+        self.assertEqual(ds.SCAN.state, 'done')
+        self.assertFalse(ds.SCAN.cached)
+        self.assertEqual(ds.SCAN.files, 1)
+
+
 class HistoryTests(Base):
     def test_changes_between_scans(self):
         write(f'{self.root}/keep/a.bin', self.blob)
