@@ -14,7 +14,12 @@ say() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 if [ "${1:-}" = "--uninstall" ]; then
-    rm -rf "$APP_DIR" "$BIN_DIR/diskscope" "$DESKTOP" "$ICON"
+    if command -v systemctl >/dev/null; then
+        systemctl --user disable --now diskscope-check.timer >/dev/null 2>&1 || true
+    fi
+    rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/diskscope-check."{service,timer}
+    rm -rf "$APP_DIR" "$BIN_DIR/diskscope" "$DESKTOP" "$ICON" \
+           "${XDG_CACHE_HOME:-$HOME/.cache}/diskscope" "${XDG_CONFIG_HOME:-$HOME/.config}/diskscope"
     command -v update-desktop-database >/dev/null && update-desktop-database "$(dirname "$DESKTOP")" 2>/dev/null || true
     say "DiskScope removed."
     exit 0
@@ -61,6 +66,7 @@ esac
     echo "Icon=diskscope"
     echo "Terminal=false"
     echo "Categories=System;Utility;"
+    echo "StartupWMClass=DiskScope"
     echo "Keywords=disk;space;usage;storage;duplicates;cleanup;"
     if [ -n "$admin_exec" ]; then
         echo "Actions=admin;"
@@ -74,6 +80,6 @@ command -v update-desktop-database >/dev/null && update-desktop-database "$(dirn
 
 say "Installed DiskScope $(python3 "$APP_DIR/diskscope.py" --version | awk '{print $2}')"
 echo "    Start it from your app menu, or run:  diskscope"
-echo "    Full view incl. system folders:       sudo $APP_DIR/diskscope.py"
+echo "    Optional extras: ffmpeg (similar photos/videos), Chrome/Chromium (opens as its own app window)"
 echo "    Uninstall:  curl -fsSL $REPO_RAW/install.sh | bash -s -- --uninstall"
 case ":$PATH:" in *":$BIN_DIR:"*) ;; *) echo "    Note: $BIN_DIR is not on your PATH; add it to use the 'diskscope' command." ;; esac
